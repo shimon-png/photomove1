@@ -1,17 +1,18 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
-import { fetchPhoto, getAccessToken, GoogleApiError, listPickedItems } from "@/lib/google";
-import { toPhotoRefs } from "@/lib/photos";
+import { sharingEnabled } from "@/lib/config";
+import { getAccessToken, GoogleApiError, listPickedItems } from "@/lib/google";
+import { toGoogleMedia } from "@/lib/photos";
 import {
   SelectionSchema,
   VideoPlanSchema,
   type ChatEvent,
   type ClientToolCall,
-  type PhotoRef,
+  type MediaMeta,
   type Selection,
+  type VideoPlan,
 } from "@/lib/plan";
-import { AskForPhotosInput, ListPhotosInput, ShareVideoInput, SYSTEM_PROMPT, tools, ViewPhotosInput } from "@/lib/tools";
-import { sharingEnabled } from "@/lib/config";
+import { AskForMediaInput, ListMediaInput, ShareVideoInput, SYSTEM_PROMPT, tools, ViewMediaInput } from "@/lib/tools";
 
 export const maxDuration = 300;
 
@@ -19,7 +20,6 @@ const client = new Anthropic();
 const MODEL = "claude-opus-5-5";
 const MAX_TURNS = 10;
 const MAX_VIEWED_PER_CONVERSATION = 36;
-const IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"] as const;
 
 const Body = z.object({
   // Conversation history is held by the browser and replayed unchanged each request.
@@ -32,7 +32,7 @@ type ToolContext = {
   googleToken: string | null;
   viewedSoFar: number;
   emit: (e: ChatEvent) => void;
-  photos?: PhotoRef[];
+  media?: MediaMeta[];
 };
 
 /** Result of a tool the server ran, or a marker that the browser must run it. */
@@ -40,48 +40,70 @@ type ToolOutcome =
   | { kind: "done"; content: string | Anthropic.Beta.BetaToolResultBlockParam["content"]; isError?: boolean }
   | { kind: "client" };
 
-async function getPhotos(ctx: ToolContext): Promise<PhotoRef[]> {
-  if (ctx.photos) return ctx.photos;
-  const sel = ctx.selection;
-  if (sel.source === "device") ctx.photos = sel.photos;
-  else if (sel.source === "google") {
-    if (!ctx.googleToken) throw new GoogleApiError(401, "Google Photos is not connected anymore. Ask the user to reconnect or pick photos from their device.");
-    ctx.photos = toPhotoRefs(await listPickedItems(ctx.googleToken, sel.pickerSessionId));
-  } else ctx.photos = [];
-  return ctx.photos;
+async function getMedia(ctx: ToolContext): Promise<MediaMeta[]> {
+  if (ctx.media) return ctx.media;
+  const media: MediaMeta[] = [...ctx.selection.device];
+  if (ctx.selection.google) {
+    if (!ctx.googleToken) throw new GoogleApiError(401, "Google Photos is not connected anymore. Ask the user to reconnect or add photos from their device.");
+    const google = toGoogleMedia(await listPickedItems(ctx.googleToken, ctx.selection.google.pickerSessionId));
+    media.push(...google.map(({ id, kind, filename, createTime, width, height }) => ({ id, kind, filename, createTime, width, height })));
+  }
+  ctx.media = media;
+  return media;
+}
+
+/** Checks a storyboard against the selected media; returns a problem description or null. */
+function checkPlan(plan: VideoPlan, media: MediaMeta[]): string | null {
+  const byId = new Map(media.map((m) => [m.id, m]));
+  const problems: string[] = [];
+  plan.scenes.forEach((s, i) => {
+    const m = byId.get(s.media_id);
+    if (!m) return problems.push(`scene ${i}: unknown media id ${s.media_id}`);
+    if (m.kind === "audio") return problems.push(`scene ${i}: ${s.media_id} is a voice note; put it in voice_notes instead`);
+    if (m.kind === "photo" && s.duration_s > 15) problems.push(`scene ${i}: photos can show for at most 15 s`);
+    if (m.kind === "video" && m.duration_s !== undefined) {
+      const start = s.clip_start_s ?? 0;
+      if (start >= m.duration_s) problems.push(`scene ${i}: clip_start_s ${start} is past the end of ${s.media_id} (${m.duration_s.toFixed(1)} s)`);
+      else if (start + s.duration_s > m.duration_s + 0.25) {
+        problems.push(`scene ${i}: ${s.media_id} is only ${m.duration_s.toFixed(1)} s long; clip_start_s + duration_s must fit`);
+      }
+    }
+  });
+  (plan.voice_notes ?? []).forEach((v, i) => {
+    const m = byId.get(v.media_id);
+    if (!m || m.kind !== "audio") problems.push(`voice_notes[${i}]: ${v.media_id} is not a voice note`);
+    if (v.at_scene >= plan.scenes.length) problems.push(`voice_notes[${i}]: at_scene ${v.at_scene} doesn't exist`);
+  });
+  return problems.length ? problems.join("; ") : null;
 }
 
 async function runTool(name: string, input: unknown, ctx: ToolContext): Promise<ToolOutcome> {
   switch (name) {
-    case "ask_for_photos": {
-      const parsed = AskForPhotosInput.safeParse(input);
+    case "ask_for_media": {
+      const parsed = AskForMediaInput.safeParse(input);
       if (!parsed.success) return invalid(input);
       ctx.emit({ type: "choose_photos", maxItems: parsed.data.max_items });
-      return { kind: "done", content: "A photo chooser is now showing. Ask the user to pick photos; you'll be told when they finish." };
+      return { kind: "done", content: "A media chooser is now showing. Ask the user to add photos, videos or voice notes; you'll be told when they finish." };
     }
-    case "list_selected_photos": {
-      if (!ListPhotosInput.safeParse(input).success) return invalid(input);
-      const photos = await getPhotos(ctx);
-      if (photos.length === 0) return { kind: "done", content: "No photos are selected yet. Call ask_for_photos." };
-      const rows = photos.map(({ id, filename, createTime, width, height }) => ({ id, filename, createTime, width, height }));
-      return { kind: "done", content: JSON.stringify({ source: ctx.selection.source, count: rows.length, photos: rows }) };
+    case "list_selected_media": {
+      if (!ListMediaInput.safeParse(input).success) return invalid(input);
+      const media = await getMedia(ctx);
+      if (media.length === 0) return { kind: "done", content: "Nothing is selected yet. Call ask_for_media." };
+      return { kind: "done", content: JSON.stringify({ count: media.length, media }) };
     }
-    case "view_photos": {
-      const parsed = ViewPhotosInput.safeParse(input);
-      if (!parsed.success) return invalid(input);
+    case "view_media": {
+      if (!ViewMediaInput.safeParse(input).success) return invalid(input);
       if (ctx.viewedSoFar >= MAX_VIEWED_PER_CONVERSATION) {
         return { kind: "done", content: "Preview limit reached for this conversation; plan from metadata.", isError: true };
       }
-      // Camera-roll photos only exist in the browser, which builds the previews itself.
-      if (ctx.selection.source === "device") return { kind: "client" };
-      return { kind: "done", content: await googlePreviews(parsed.data.photo_ids, ctx) };
+      // Media lives in the browser (device files) or behind its image proxy (Google), so it builds the previews.
+      return { kind: "client" };
     }
     case "create_video": {
-      const parsed = VideoPlanSchema.safeParse(input);
+      const parsed = VideoPlanSchema.omit({ music: true }).safeParse(input);
       if (!parsed.success) return { kind: "done", content: `Invalid storyboard: ${parsed.error.message}`, isError: true };
-      const known = new Set((await getPhotos(ctx)).map((p) => p.id));
-      const unknown = parsed.data.scenes.map((s) => s.photo_id).filter((id) => !known.has(id));
-      if (unknown.length) return { kind: "done", content: `Unknown photo ids: ${unknown.join(", ")}`, isError: true };
+      const problem = checkPlan(parsed.data, await getMedia(ctx));
+      if (problem) return { kind: "done", content: `Please fix the storyboard: ${problem}`, isError: true };
       ctx.emit({ type: "video_plan", plan: parsed.data });
       const total = parsed.data.scenes.reduce((s, x) => s + x.duration_s, 0);
       return { kind: "done", content: `Rendering started in the user's browser: ${parsed.data.scenes.length} scenes, about ${Math.round(total)} s.` };
@@ -100,30 +122,11 @@ async function runTool(name: string, input: unknown, ctx: ToolContext): Promise<
   }
 }
 
-async function googlePreviews(ids: string[], ctx: ToolContext) {
-  const photos = await getPhotos(ctx);
-  const wanted = ids.slice(0, MAX_VIEWED_PER_CONVERSATION - ctx.viewedSoFar);
-  const blocks: Anthropic.Beta.BetaToolResultBlockParam["content"] = [];
-  for (const id of wanted) {
-    const photo = photos.find((p) => p.id === id);
-    if (!photo?.baseUrl) {
-      blocks.push({ type: "text", text: `${id}: unknown id` });
-      continue;
-    }
-    const { bytes, contentType } = await fetchPhoto(ctx.googleToken!, photo.baseUrl, 384);
-    const mediaType = IMAGE_TYPES.find((t) => contentType.startsWith(t)) ?? "image/jpeg";
-    blocks.push({ type: "text", text: `${id}${photo.createTime ? ` (taken ${photo.createTime})` : ""}:` });
-    blocks.push({ type: "image", source: { type: "base64", media_type: mediaType, data: Buffer.from(bytes).toString("base64") } });
-    ctx.viewedSoFar++;
-  }
-  return blocks;
-}
-
 function invalid(input: unknown): ToolOutcome {
   return { kind: "done", content: JSON.stringify({ INVALID_JSON: JSON.stringify(input) }), isError: true };
 }
 
-/** Counts images already returned by view_photos earlier in the conversation. */
+/** Counts images already returned by view_media earlier in the conversation. */
 function countViewed(messages: Anthropic.Beta.BetaMessageParam[]): number {
   let n = 0;
   for (const m of messages) {
@@ -143,8 +146,8 @@ export async function POST(req: Request) {
   const { selection } = parsedBody.data;
 
   // Refresh Google tokens before streaming starts (cookies can't be set mid-stream).
-  const googleToken = selection.source === "google" ? await getAccessToken() : null;
-  if (selection.source === "google" && !googleToken) {
+  const googleToken = selection.google ? await getAccessToken() : null;
+  if (selection.google && !googleToken) {
     return Response.json({ error: "Not connected to Google Photos" }, { status: 401 });
   }
 
@@ -250,12 +253,12 @@ export async function POST(req: Request) {
 
 function statusLabel(tool: string) {
   switch (tool) {
-    case "ask_for_photos":
-      return "Asking for photos…";
-    case "list_selected_photos":
-      return "Reading your selected photos…";
-    case "view_photos":
-      return "Looking at your photos…";
+    case "ask_for_media":
+      return "Asking for photos and videos…";
+    case "list_selected_media":
+      return "Reading your selection…";
+    case "view_media":
+      return "Looking at your photos and videos…";
     case "create_video":
       return "Building the storyboard…";
     case "share_video":

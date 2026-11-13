@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { PhotoRef, VideoPlan } from "@/lib/plan";
-import { prefs, sendShare, ShareError, uploadPhotos } from "@/lib/share-client";
+import type { MediaRef, VideoPlan } from "@/lib/plan";
+import { prefs, sendShare, ShareError, uploadMedia, type SharedMediaInput } from "@/lib/share-client";
 
 export type ShareRequest = { recipientName: string; phone: string; nonce: number };
 
@@ -13,7 +13,17 @@ type Sent = { name: string; phone: string };
  * nothing is sent until the user taps Send. Photos are uploaded once per video;
  * later recipients reuse the same share (and see each other's reactions).
  */
-export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos: PhotoRef[]; request: ShareRequest | null }) {
+export function SharePanel({
+  plan,
+  media,
+  request,
+  uploadMode,
+}: {
+  plan: VideoPlan;
+  media: MediaRef[];
+  request: ShareRequest | null;
+  uploadMode: "blob" | "direct";
+}) {
   const [open, setOpen] = useState(false);
   const [senderName, setSenderName] = useState("");
   const [recipientName, setRecipientName] = useState("");
@@ -24,7 +34,7 @@ export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos:
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [share, setShare] = useState<{ id: string; url: string } | null>(null);
-  const [uploaded, setUploaded] = useState<{ id: string; url: string; createTime?: string }[] | null>(null);
+  const [uploaded, setUploaded] = useState<SharedMediaInput[] | null>(null);
   const [sent, setSent] = useState<Sent[]>([]);
   const [copied, setCopied] = useState(false);
 
@@ -39,7 +49,7 @@ export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos:
     setShare(null);
     setUploaded(null);
     setSent([]);
-  }, [plan, photos]);
+  }, [plan, media]);
 
   useEffect(() => {
     if (!request) return;
@@ -62,11 +72,11 @@ export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos:
     }
     prefs.senderName = senderName.trim();
     try {
-      let photosForShare = uploaded;
-      if (!share && !photosForShare) {
-        setBusy("Uploading photos…");
-        photosForShare = await uploadPhotos(plan, photos, passcode.trim(), (d, t) => setBusy(`Uploading photos ${d}/${t}…`));
-        setUploaded(photosForShare);
+      let mediaForShare = uploaded;
+      if (!share && !mediaForShare) {
+        setBusy("Uploading…");
+        mediaForShare = await uploadMedia(plan, media, passcode.trim(), uploadMode, (d, t) => setBusy(`Uploading ${d}/${t}…`));
+        setUploaded(mediaForShare);
       }
       setBusy("Sending text…");
       const result = await sendShare(
@@ -75,7 +85,7 @@ export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos:
           recipientName: recipientName.trim(),
           phone: phone.trim(),
           note: note.trim() || undefined,
-          ...(share ? { shareId: share.id } : { plan, photos: photosForShare! }),
+          ...(share ? { shareId: share.id } : { plan, media: mediaForShare! }),
         },
         passcode.trim(),
       );
@@ -150,7 +160,7 @@ export function SharePanel({ plan, photos, request }: { plan: VideoPlan; photos:
             )}
           </div>
           <p className="text-xs text-muted">
-            Sharing uploads the photos in this video so the link works on their phone. They can reply to the text to add a reaction to the video.
+            Sharing uploads the photos, clips and voice notes in this video so the link works on their phone. They can reply to the text to add a reaction to the video.
           </p>
           {error && <p className="text-danger">{error}</p>}
           <div className="flex gap-2">

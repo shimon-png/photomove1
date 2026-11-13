@@ -1,6 +1,6 @@
 # Reelbot
 
-A chatbot that turns your photos into short videos. Photos can come from your **phone's camera roll** (or files on a computer) or, optionally, **Google Photos**.
+A chatbot that turns your photos, video clips and voice notes into short videos. Photos and videos can come from your **phone's camera roll** (or files on a computer). You can record voice notes in the app or pick audio files. Photos can also come from **Google Photos** (optional).
 
 1. You choose photos. On a phone, "From this device" opens the camera roll. Google Photos uses Google's own picker.
 2. You tell Reelbot what you want ("a 30-second vertical reel of my trip, upbeat, with captions").
@@ -8,6 +8,13 @@ A chatbot that turns your photos into short videos. Photos can come from your **
 4. Your browser renders the storyboard to an MP4 (or WebM, depending on the browser) that you can preview, add a soundtrack to, and download.
 
 Ask for changes in chat ("slower", "drop the third photo", "make it square") and Reelbot re-renders.
+
+## Media and music
+
+- **Photos** get slow pan and zoom ("Ken Burns") motion. **Video clips** play a part Claude chooses (`clip_start_s` + `duration_s`), with or without their own sound. **Voice notes** play from a chosen scene. Claude can't hear them, so it places them by length and asks you what they're about when that matters.
+- To understand a clip, Claude sees a strip of three frames (start, middle and end), plus the clip's length and capture date (read from the MP4/MOV header).
+- **Music:** three bundled tracks in `public/music/` (AAC, so they play on iPhone too), listed in `MUSIC_TRACKS` in `src/lib/plan.ts`. One is picked at random for each visit. Under the video you can preview them, switch, or turn music off. The music gets quieter under voice notes and clip sound, and fades out at the end.
+- Everything is mixed in the browser with Web Audio and recorded together with the canvas, so the downloaded file has the sound in it. If the browser blocks sound (autoplay rules), the app says so and offers **Re-render**.
 
 ## How it works
 
@@ -21,9 +28,9 @@ Ask for changes in chat ("slower", "drop the third photo", "make it square") and
 | Video renderer (canvas + MediaRecorder, optional audio) | `src/lib/render.ts`, `src/components/VideoPanel.tsx` |
 | Chat UI | `src/components/Reelbot.tsx` |
 
-Claude's tools are `ask_for_photos`, `list_selected_photos`, `view_photos` (small previews, so Claude can see what is in each photo) and `create_video` (the storyboard). Each tool input is checked with Zod before it runs.
+Claude's tools are `ask_for_media`, `list_selected_media`, `view_media` (small previews, so Claude can see what is in each photo or clip), `create_video` (the storyboard) and `share_video`. Each tool input is checked with Zod before it runs.
 
-**Camera-roll photos never leave the phone.** The browser keeps the original files. When Claude asks to see photos, the server hands the `view_photos` call back to the browser. The browser makes ~384 px JPEG previews and sends them in the next request. Only photo metadata (size, capture date, file name) and those previews reach the server.
+**Camera-roll media stays on the phone unless you share a video.** The browser keeps the original files. When Claude asks to see media, the server hands the `view_media` call back to the browser. The browser makes ~384 px JPEG previews (a frame strip for videos) and sends them in the next request. Only metadata (size, length, capture date, file name) and those previews reach the server.
 
 **Why the Google picker?** Since March 2025, Google only lets third-party apps read photos the user explicitly picks, through the [Google Photos Picker API](https://developers.google.com/photos/picker). The older Library API can no longer read a user's whole library. So Reelbot can't search all of your photos. It works with the ones you hand it.
 
@@ -62,7 +69,7 @@ The chat route sets `maxDuration = 300`. On Vercel plans with a lower function l
 Under a finished video, **Share by text message** (or just tell the chatbot "send it to Mom, +1 555 123 4567") texts the person a link to the video. When they reply to that text, their reply is added to the video as a quote card. Claude places it next to the moment they're talking about, or at the end if it's about the whole video. Everyone with the link sees the updated video. The page plays the video live and refreshes itself every few seconds, and anyone can save it as an MP4.
 
 How it works:
-- Sharing uploads the video's photos (resized to 1920 px) to Vercel Blob. The storyboard, the recipients and the reactions are stored in Upstash Redis. Links look like `/s/<random id>`, and phone numbers are never shown on the page.
+- Sharing uploads the video's media to Vercel Blob. Photos are resized to 1920 px and go through the app. Video clips and voice notes upload straight from the browser to Blob using a short-lived client token (`/api/shares/upload-token`, passcode-checked), up to 200 MB each. The share page downloads them before playing. The storyboard, the recipients and the reactions are stored in Upstash Redis. Links look like `/s/<random id>`, and phone numbers are never shown on the page.
 - Twilio sends the text. Replies come in at `/api/sms/inbound`, which checks Twilio's signature. STOP/HELP keywords are left to Twilio, and a reply is matched to the latest video texted to that number.
 - Sending needs the `SHARE_PASSCODE`, and there's a cap of 50 texts per day, so a public deployment can't be used to spam people.
 

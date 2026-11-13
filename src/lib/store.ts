@@ -93,7 +93,9 @@ export function kv(): KV {
 
 /** Stores a photo publicly (unguessable URL) and returns its URL. */
 export async function putPhoto(bytes: Uint8Array, contentType: string, shareKey: string): Promise<string> {
-  const ext = contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg";
+  const ext = contentType.startsWith("image/")
+    ? contentType === "image/png" ? "png" : contentType === "image/webp" ? "webp" : "jpg"
+    : contentType.split("/")[1]?.replace(/[^a-z0-9]/g, "") || "bin";
   if (devMemoryStore()) {
     const key = `${shareKey}-${crypto.randomUUID()}.${ext}`;
     mem.blobs.set(key, { bytes, type: contentType });

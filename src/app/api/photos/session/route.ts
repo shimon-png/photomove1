@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { createPickerSession, getAccessToken, getPickerSession, GoogleApiError, listPickedItems } from "@/lib/google";
-import { toPhotoRefs } from "@/lib/photos";
+import { toGoogleMedia } from "@/lib/photos";
 
 /** Starts a Google Photos picker session; the browser opens the returned pickerUri. */
 export async function POST(req: Request) {
@@ -28,8 +28,8 @@ export async function GET(req: NextRequest) {
   try {
     const session = await getPickerSession(token, id);
     if (!session.mediaItemsSet) return Response.json({ ready: false, pollInterval: session.pollingConfig?.pollInterval });
-    const photos = toPhotoRefs(await listPickedItems(token, id));
-    return Response.json({ ready: true, photos });
+    const media = toGoogleMedia(await listPickedItems(token, id));
+    return Response.json({ ready: true, media });
   } catch (err) {
     const status = err instanceof GoogleApiError ? err.status : 500;
     return Response.json({ error: "Could not read picker session" }, { status: status === 404 ? 404 : 502 });

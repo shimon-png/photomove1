@@ -3,7 +3,7 @@ import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import { appUrl } from "./config";
 import { maskPhone } from "./phone";
-import { VideoPlanSchema, type ReactionCard, type VideoPlan } from "./plan";
+import { MEDIA_KINDS, VideoPlanSchema, type ReactionCard, type VideoPlan } from "./plan";
 import { kv } from "./store";
 
 /**
@@ -17,19 +17,21 @@ import { kv } from "./store";
 const TTL_DAYS = 365;
 const PHONE_TTL_S = 60 * 60 * 24 * 90;
 
-export const SharedPhotoSchema = z.object({
+export const SharedMediaSchema = z.object({
   id: z.string().max(10),
+  kind: z.enum(MEDIA_KINDS),
   url: z.string().url().max(500),
   createTime: z.string().max(40).optional(),
+  duration_s: z.number().min(0).max(36000).optional(),
 });
-export type SharedPhoto = z.infer<typeof SharedPhotoSchema>;
+export type SharedMedia = z.infer<typeof SharedMediaSchema>;
 
 export type ShareRecord = {
   id: string;
   createdAt: string;
   senderName: string;
   plan: VideoPlan;
-  photos: SharedPhoto[];
+  media: SharedMedia[];
 };
 export type Recipient = { name: string; phone: string; at: string };
 export type Reaction = { id: string; author: string; phone: string; text: string; at: string };
@@ -39,7 +41,7 @@ export type PublicShare = {
   id: string;
   senderName: string;
   plan: VideoPlan;
-  photos: SharedPhoto[];
+  media: SharedMedia[];
   recipients: { name: string }[];
   reactions: { id: string; author: string; text: string; at: string; placed: boolean }[];
   version: string;
@@ -61,9 +63,9 @@ function newId(bytes = 9) {
   return Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString("base64url");
 }
 
-export async function createShare(input: { senderName: string; plan: VideoPlan; photos: SharedPhoto[] }): Promise<ShareRecord> {
+export async function createShare(input: { senderName: string; plan: VideoPlan; media: SharedMedia[] }): Promise<ShareRecord> {
   const plan = VideoPlanSchema.parse(input.plan); // drops any client-supplied reactions
-  const record: ShareRecord = { id: newId(), createdAt: new Date().toISOString(), senderName: input.senderName, plan, photos: input.photos };
+  const record: ShareRecord = { id: newId(), createdAt: new Date().toISOString(), senderName: input.senderName, plan, media: input.media };
   await kv().setJson(keys.share(record.id), record, TTL_DAYS * 86400);
   return record;
 }
@@ -119,7 +121,7 @@ export async function getPublicShare(id: string): Promise<PublicShare | null> {
     id,
     senderName: record.senderName,
     plan: { ...record.plan, reactions: cards },
-    photos: record.photos,
+    media: record.media,
     recipients: uniqueNames.map((name) => ({ name })),
     reactions: reactions.map((r) => ({ id: r.id, author: r.author, text: r.text, at: r.at, placed: r.id in placements })),
     version: `${reactions.length}:${Object.keys(placements).length}`,
@@ -151,13 +153,13 @@ export async function placeReaction(id: string, reaction: Reaction): Promise<num
   let afterScene = last;
   try {
     const existing = await getPublicShare(id);
-    const photoUrl = new Map(record.photos.map((p) => [p.id, p.url]));
+    const mediaById = new Map(record.media.map((m) => [m.id, m]));
     const content: Anthropic.Beta.BetaContentBlockParam[] = [];
     const showImages = record.plan.scenes.length <= 40;
     record.plan.scenes.forEach((s, i) => {
-      content.push({ type: "text", text: `Scene ${i}: photo ${s.photo_id}${s.caption ? `, caption "${s.caption}"` : ""}` });
-      const url = photoUrl.get(s.photo_id);
-      if (showImages && url?.startsWith("https://")) content.push({ type: "image", source: { type: "url", url } });
+      const m = mediaById.get(s.media_id);
+      content.push({ type: "text", text: `Scene ${i}: ${m?.kind ?? "photo"} ${s.media_id}${s.caption ? `, caption "${s.caption}"` : ""}` });
+      if (showImages && m?.kind === "photo" && m.url.startsWith("https://")) content.push({ type: "image", source: { type: "url", url: m.url } });
     });
     const others = (existing?.plan.reactions ?? [])
       .filter((r, i) => existing?.reactions[i]?.id !== reaction.id)

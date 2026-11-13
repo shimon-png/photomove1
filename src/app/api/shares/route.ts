@@ -2,7 +2,7 @@ import { z } from "zod";
 import { guardSharing } from "@/lib/guard";
 import { normalizePhone } from "@/lib/phone";
 import { VideoPlanSchema } from "@/lib/plan";
-import { addRecipient, createShare, getShareRecord, shareUrl, SharedPhotoSchema } from "@/lib/shares";
+import { addRecipient, createShare, getShareRecord, shareUrl, SharedMediaSchema } from "@/lib/shares";
 import { isSharedPhotoUrl } from "@/lib/store";
 import { sendSms, SmsError } from "@/lib/twilio";
 
@@ -14,7 +14,7 @@ const Body = z.object({
   // Either an existing share (texting one more person) or a new video to share.
   shareId: z.string().max(40).optional(),
   plan: VideoPlanSchema.optional(),
-  photos: z.array(SharedPhotoSchema).max(100).optional(),
+  media: z.array(SharedMediaSchema).max(100).optional(),
 });
 
 /** Creates a share (or reuses one) and texts the link to a recipient. */
@@ -31,12 +31,13 @@ export async function POST(req: Request) {
   if (shareId) {
     if (!(await getShareRecord(shareId))) return Response.json({ error: "That shared video no longer exists." }, { status: 404 });
   } else {
-    if (!b.plan || !b.photos) return Response.json({ error: "Missing video" }, { status: 400 });
-    const have = new Set(b.photos.map((p) => p.id));
-    if (b.plan.scenes.some((s) => !have.has(s.photo_id)) || b.photos.some((p) => !isSharedPhotoUrl(p.url))) {
-      return Response.json({ error: "Some photos weren't uploaded. Please try again." }, { status: 400 });
+    if (!b.plan || !b.media) return Response.json({ error: "Missing video" }, { status: 400 });
+    const have = new Set(b.media.map((m) => m.id));
+    const needed = [...b.plan.scenes.map((s) => s.media_id), ...(b.plan.voice_notes ?? []).map((v) => v.media_id)];
+    if (needed.some((id) => !have.has(id)) || b.media.some((m) => !isSharedPhotoUrl(m.url))) {
+      return Response.json({ error: "Some photos or videos weren't uploaded. Please try again." }, { status: 400 });
     }
-    shareId = (await createShare({ senderName: b.senderName, plan: b.plan, photos: b.photos })).id;
+    shareId = (await createShare({ senderName: b.senderName, plan: b.plan, media: b.media })).id;
   }
 
   const url = shareUrl(shareId);

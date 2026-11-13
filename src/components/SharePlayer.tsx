@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { PhotoRef } from "@/lib/plan";
+import type { MediaRef } from "@/lib/plan";
 import { drawFrame, playStoryboard, prepareStoryboard, renderVideo, type Storyboard } from "@/lib/render";
 import type { PublicShare } from "@/lib/shares";
 
@@ -27,14 +27,18 @@ export function SharePlayer({ initial }: { initial: PublicShare }) {
   const playAbort = useRef<AbortController | null>(null);
   const versionRef = useRef(initial.version);
 
-  const photos: PhotoRef[] = share.photos.map((p) => ({ id: p.id, url: p.url, createTime: p.createTime }));
+  const media: MediaRef[] = share.media.map((m) => ({ id: m.id, kind: m.kind, url: m.url, createTime: m.createTime, duration_s: m.duration_s }));
 
   // (Re)build the storyboard whenever the share changes.
   useEffect(() => {
     let cancelled = false;
     let built: Storyboard | null = null;
     setLoading((l) => l ?? "Updating video…");
-    prepareStoryboard(share.plan, share.photos.map((p) => ({ id: p.id, url: p.url })), (f, label) => setLoading(label))
+    prepareStoryboard(
+      share.plan,
+      share.media.map((m) => ({ id: m.id, kind: m.kind, url: m.url, duration_s: m.duration_s })),
+      (f, label) => setLoading(label),
+    )
       .then((next) => {
         if (cancelled) return next.dispose();
         built = next;
@@ -103,7 +107,7 @@ export function SharePlayer({ initial }: { initial: PublicShare }) {
     try {
       const res = await renderVideo({
         plan: share.plan,
-        photos,
+        media,
         canvas: recordRef.current,
         onProgress: (f) => setSaving(`Saving ${Math.round(f * 100)}% — keep this page open`),
       });

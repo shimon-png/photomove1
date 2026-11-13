@@ -1,17 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { loadDevicePhotos, MAX_DEVICE_PHOTOS, previewBase64 } from "@/lib/device";
-import type { ChatEvent, ClientToolCall, PhotoRef, Selection, VideoPlan } from "@/lib/plan";
+import { loadDeviceMedia, MAX_DEVICE_ITEMS, mediaPreviewBase64 } from "@/lib/device";
+import type { ChatEvent, ClientToolCall, MediaRef, Selection, VideoPlan } from "@/lib/plan";
 import { imageUrl } from "@/lib/render";
 import type { ShareRequest } from "./SharePanel";
 import { VideoPanel } from "./VideoPanel";
+import { VoiceRecorder } from "./VoiceRecorder";
 
 /** Raw API message as returned by the server; replayed unchanged on every request. */
 type ContentBlock = { type: string; text?: string; content?: unknown };
 type ApiMessage = { role: "user" | "assistant"; content: string | ContentBlock[] };
 type Bubble = { role: "user" | "assistant"; text: string };
-type Me = { googleConfigured: boolean; googleConnected: boolean; sharingEnabled?: boolean };
+type Me = { googleConfigured: boolean; googleConnected: boolean; sharingEnabled?: boolean; shareUploads?: "blob" | "direct" };
 type GooglePick = { sessionId: string; pickerUri: string; status: "waiting" | "expired" };
 
 const MAX_PREVIEWS = 36; // matches the server's per-conversation cap
@@ -62,14 +63,15 @@ export function Reelbot() {
   const [chooser, setChooser] = useState<{ maxItems: number } | null>(null);
   const [googlePick, setGooglePick] = useState<GooglePick | null>(null);
   const [preparing, setPreparing] = useState<string | null>(null);
-  const [photos, setPhotos] = useState<PhotoRef[]>([]);
+  const [media, setMedia] = useState<MediaRef[]>([]);
   const [plan, setPlan] = useState<VideoPlan | null>(null);
   const [shareRequest, setShareRequest] = useState<ShareRequest | null>(null);
   const messagesRef = useRef<ApiMessage[]>([]);
-  const selectionRef = useRef<Selection>({ source: "none" });
-  const photosRef = useRef<PhotoRef[]>([]);
+  const selectionRef = useRef<Selection>({ device: [] });
+  const mediaRef = useRef<MediaRef[]>([]);
   const busyRef = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const audioFileRef = useRef<HTMLInputElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const setHistory = (h: ApiMessage[]) => {
@@ -172,16 +174,20 @@ export function Reelbot() {
     let remaining = MAX_PREVIEWS - countPreviews(messagesRef.current);
     const out: unknown[] = [];
     for (const call of calls) {
-      const ids = (call.input as { photo_ids?: unknown }).photo_ids;
-      if (call.name !== "view_photos" || !Array.isArray(ids)) {
+      const ids = (call.input as { media_ids?: unknown }).media_ids;
+      if (call.name !== "view_media" || !Array.isArray(ids)) {
         out.push({ type: "tool_result", tool_use_id: call.id, content: "Unsupported tool", is_error: true });
         continue;
       }
       const blocks: unknown[] = [];
       for (const id of ids.slice(0, 12)) {
-        const photo = photosRef.current.find((p) => p.id === id);
-        if (!photo?.file) {
+        const m = mediaRef.current.find((x) => x.id === id);
+        if (!m) {
           blocks.push({ type: "text", text: `${id}: unknown id` });
+          continue;
+        }
+        if (m.kind === "audio") {
+          blocks.push({ type: "text", text: `${id}: voice note (${m.duration_s ?? "?"} s); it can't be previewed` });
           continue;
         }
         if (remaining <= 0) {
@@ -189,8 +195,9 @@ export function Reelbot() {
           break;
         }
         try {
-          const data = await previewBase64(photo.file);
-          blocks.push({ type: "text", text: `${id}${photo.createTime ? ` (taken ${photo.createTime})` : ""}:` });
+          const data = await mediaPreviewBase64(m);
+          const what = m.kind === "video" ? `video, ${m.duration_s} s; frames from start, middle, end` : "photo";
+          blocks.push({ type: "text", text: `${id} (${what}${m.createTime ? `, taken ${m.createTime}` : ""}):` });
           blocks.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data } });
           remaining--;
         } catch {
@@ -214,7 +221,7 @@ export function Reelbot() {
           const pending = await chatTurn(next);
           next = null;
           if (pending) {
-            setStatus("Looking at your photos…");
+            setStatus("Looking at your photos and videos…");
             const clientResults = await runClientTools(pending.calls);
             next = { role: "user", content: [...pending.results, ...clientResults] as ContentBlock[] };
           }
@@ -232,37 +239,57 @@ export function Reelbot() {
   );
 
   const applySelection = useCallback(
-    (selection: Selection, picked: PhotoRef[], note: string) => {
-      selectionRef.current = selection;
-      photosRef.current = picked;
-      setPhotos(picked);
-      setPlan(null);
+    (all: MediaRef[], google: Selection["google"], note: string | null) => {
+      const device = all.filter((m) => !m.baseUrl).map(({ id, kind, filename, createTime, width, height, duration_s }) => ({
+        id, kind, filename, createTime, width, height, duration_s,
+      }));
+      selectionRef.current = { device, google };
+      mediaRef.current = all;
+      setMedia(all);
       setChooser(null);
-      void send({ role: "user", content: note });
+      if (note) void send({ role: "user", content: note });
     },
     [send],
   );
 
-  // ---- Device / camera roll ----
-  const onFiles = async (files: FileList | null) => {
-    if (!files?.length) return;
+  // ---- Device: camera roll, files, voice notes (added to the current selection) ----
+  const addFiles = async (files: File[]) => {
+    if (!files.length) return;
     setError(null);
-    setPreparing(`Preparing photos 0/${Math.min(files.length, MAX_DEVICE_PHOTOS)}…`);
+    const existing = mediaRef.current.filter((m) => !m.baseUrl);
+    setPreparing(`Preparing 0/${files.length}…`);
     try {
-      const { photos: picked, skipped } = await loadDevicePhotos([...files], (d, t) => setPreparing(`Preparing photos ${d}/${t}…`));
-      if (!picked.length) {
-        setError("None of those files could be opened as photos. HEIC files may need a phone or Safari.");
+      const { media: added, skipped } = await loadDeviceMedia(files, existing, (d, t) => setPreparing(`Preparing ${d}/${t}…`));
+      if (!added.length) {
+        setError("Those files couldn't be opened. HEIC photos and some video formats need a phone or Safari.");
         return;
       }
-      const meta = picked.map(({ id, filename, createTime, width, height }) => ({ id, filename, createTime, width, height }));
-      let note = `I've picked ${picked.length} photo${picked.length === 1 ? "" : "s"} from my device.`;
-      if (files.length > MAX_DEVICE_PHOTOS) note += ` (Only the first ${MAX_DEVICE_PHOTOS} were used.)`;
+      const count = (k: MediaRef["kind"]) => added.filter((m) => m.kind === k).length;
+      const parts = [
+        [count("photo"), "photo"],
+        [count("video"), "video"],
+        [count("audio"), "voice note"],
+      ]
+        .filter(([n]) => n)
+        .map(([n, w]) => `${n} ${w}${n === 1 ? "" : "s"}`);
+      let note = `I've added ${parts.join(", ").replace(/, ([^,]*)$/, " and $1")} from my device.`;
+      if (existing.length + files.length > MAX_DEVICE_ITEMS) note += ` (Only ${MAX_DEVICE_ITEMS} items in total can be used.)`;
       if (skipped.length) note += ` (${skipped.length} couldn't be opened.)`;
-      applySelection({ source: "device", photos: meta }, picked, note);
+      const google = mediaRef.current.filter((m) => m.baseUrl);
+      applySelection([...existing, ...added, ...google], selectionRef.current.google, busyRef.current ? null : note);
     } finally {
       setPreparing(null);
       if (fileRef.current) fileRef.current.value = "";
+      if (audioFileRef.current) audioFileRef.current.value = "";
     }
+  };
+
+  const clearSelection = () => {
+    for (const m of mediaRef.current) if (m.thumb) URL.revokeObjectURL(m.thumb);
+    selectionRef.current = { device: [] };
+    mediaRef.current = [];
+    setMedia([]);
+    setPlan(null);
   };
 
   // ---- Google Photos ----
@@ -312,13 +339,14 @@ export function Reelbot() {
       if (Date.now() - started > 25 * 60_000) return setGooglePick((p) => (p ? { ...p, status: "expired" } : p));
       try {
         const r = await fetch(`/api/photos/session?id=${encodeURIComponent(googlePick.sessionId)}`);
-        const d = (await r.json()) as { ready?: boolean; photos?: PhotoRef[] };
-        if (!cancelled && d.ready && d.photos) {
+        const d = (await r.json()) as { ready?: boolean; media?: MediaRef[] };
+        if (!cancelled && d.ready && d.media) {
           setGooglePick(null);
-          const n = d.photos.length;
+          const n = d.media.length;
+          const device = mediaRef.current.filter((m) => !m.baseUrl);
           applySelection(
-            { source: "google", pickerSessionId: googlePick.sessionId },
-            d.photos,
+            [...device, ...d.media],
+            { pickerSessionId: googlePick.sessionId },
             `I've picked ${n} photo${n === 1 ? "" : "s"} from Google Photos.`,
           );
           return;
@@ -335,12 +363,20 @@ export function Reelbot() {
     };
   }, [googlePick, applySelection]);
 
-  // Thumbnails: object URLs for device photos, the image proxy for Google ones.
+  // Thumbnails: object URLs for device photos, poster frames for videos, the image proxy for Google photos.
   const thumbs = useMemo(
-    () => photos.slice(0, 40).map((p) => ({ id: p.id, alt: p.filename ?? p.id, src: p.file ? URL.createObjectURL(p.file) : imageUrl(p, 160) })),
-    [photos],
+    () =>
+      media.slice(0, 60).map((m) => ({
+        id: m.id,
+        kind: m.kind,
+        duration: m.duration_s,
+        alt: m.filename ?? m.id,
+        src: m.kind === "photo" ? (m.file ? URL.createObjectURL(m.file) : imageUrl(m, 160)) : m.thumb,
+        own: m.kind === "photo" && Boolean(m.file),
+      })),
+    [media],
   );
-  useEffect(() => () => thumbs.forEach((t) => t.src.startsWith("blob:") && URL.revokeObjectURL(t.src)), [thumbs]);
+  useEffect(() => () => thumbs.forEach((t) => t.own && t.src && URL.revokeObjectURL(t.src)), [thumbs]);
 
   const submit = (text: string) => {
     const t = text.trim();
@@ -352,26 +388,32 @@ export function Reelbot() {
   const disconnect = async () => {
     await fetch("/api/auth/logout", { method: "POST" });
     setMe((m) => (m ? { ...m, googleConnected: false } : m));
-    if (selectionRef.current.source === "google") {
-      selectionRef.current = { source: "none" };
-      photosRef.current = [];
-      setPhotos([]);
+    if (selectionRef.current.google) {
+      applySelection(mediaRef.current.filter((m) => !m.baseUrl), undefined, null);
       setPlan(null);
     }
   };
 
   const bubbles = toBubbles(messages);
-  const showChooser = !busy && !preparing && !googlePick && (chooser || photos.length === 0);
+  const showChooser = !busy && !preparing && !googlePick && (chooser || media.length === 0);
 
   return (
     <div className="mx-auto flex min-h-screen max-w-3xl flex-col px-4">
       <input
         ref={fileRef}
         type="file"
-        accept="image/*"
+        accept="image/*,video/*"
         multiple
         className="hidden"
-        onChange={(e) => void onFiles(e.target.files)}
+        onChange={(e) => void addFiles([...(e.target.files ?? [])])}
+      />
+      <input
+        ref={audioFileRef}
+        type="file"
+        accept="audio/*"
+        multiple
+        className="hidden"
+        onChange={(e) => void addFiles([...(e.target.files ?? [])])}
       />
       <header className="flex items-center justify-between py-4">
         <div className="flex items-center gap-2">
@@ -388,10 +430,10 @@ export function Reelbot() {
       <div className="flex-1 space-y-3 pb-4">
         {bubbles.length === 0 && !busy && (
           <section className="rounded-2xl border border-border bg-surface p-6">
-            <h1 className="text-xl font-semibold">Turn your photos into a video</h1>
+            <h1 className="text-xl font-semibold">Turn your photos, clips and voice notes into a video</h1>
             <p className="mt-1 text-muted">
-              Choose photos from your camera roll{me?.googleConfigured ? " or Google Photos" : ""}, say what you want, and
-              Reelbot storyboards and renders a video you can download.
+              Add photos and videos from your camera roll{me?.googleConfigured ? " or Google Photos" : ""}, record a voice note if you
+              like, say what you want, and Reelbot storyboards and renders a video you can download.
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               {SUGGESTIONS.map((s) => (
@@ -414,27 +456,60 @@ export function Reelbot() {
         {status && <p className="text-sm text-muted">{status}</p>}
 
         {thumbs.length > 0 && (
-          <div className="flex gap-1.5 overflow-x-auto rounded-2xl border border-border bg-surface p-3">
-            {thumbs.map((t) => (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img key={t.id} src={t.src} alt={t.alt} className="h-16 w-16 flex-none rounded object-cover" />
-            ))}
-            {photos.length > thumbs.length && (
-              <span className="self-center px-2 text-sm text-muted">+{photos.length - thumbs.length}</span>
+          <div className="rounded-2xl border border-border bg-surface p-3">
+            <div className="flex gap-1.5 overflow-x-auto">
+              {thumbs.map((t) =>
+                t.kind === "audio" ? (
+                  <div key={t.id} className="grid h-16 w-16 flex-none place-items-center rounded bg-surface-2 text-center text-xs" title={t.alt}>
+                    <span className="text-lg" aria-hidden>
+                      🎙
+                    </span>
+                    {formatDuration(t.duration)}
+                  </div>
+                ) : (
+                  <div key={t.id} className="relative h-16 w-16 flex-none overflow-hidden rounded bg-black">
+                    {t.src && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img src={t.src} alt={t.alt} className="h-full w-full object-cover" />
+                    )}
+                    {t.kind === "video" && (
+                      <span className="absolute bottom-0.5 right-0.5 rounded bg-black/70 px-1 text-[10px] text-white">
+                        ▶ {formatDuration(t.duration)}
+                      </span>
+                    )}
+                  </div>
+                ),
+              )}
+              {media.length > thumbs.length && <span className="self-center px-2 text-sm text-muted">+{media.length - thumbs.length}</span>}
+            </div>
+            {!showChooser && !busy && (
+              <div className="mt-2 flex gap-3 text-xs">
+                <button onClick={() => setChooser({ maxItems: 30 })} className="text-accent underline">
+                  Add more
+                </button>
+                <button onClick={clearSelection} className="text-muted underline">
+                  Clear
+                </button>
+              </div>
             )}
           </div>
         )}
 
         {showChooser && (
           <div className="rounded-2xl border border-border bg-surface p-4">
-            <p className="text-sm font-medium">{photos.length ? "Choose different photos" : "Add photos"}</p>
+            <p className="text-sm font-medium">{media.length ? "Add more" : "Add photos, videos and voice notes"}</p>
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              <button onClick={() => fileRef.current?.click()} className="rounded-xl bg-accent px-4 py-3 text-left font-medium text-white">
+                Photos &amp; videos
+                <span className="block text-xs font-normal opacity-80">From your camera roll, or files on a computer</span>
+              </button>
+              <VoiceRecorder onRecorded={(file) => void addFiles([file])} onError={setError} />
               <button
-                onClick={() => fileRef.current?.click()}
-                className="rounded-xl bg-accent px-4 py-3 text-left font-medium text-white"
+                onClick={() => audioFileRef.current?.click()}
+                className="rounded-xl border border-border px-4 py-3 text-left font-medium hover:bg-surface-2"
               >
-                From this device
-                <span className="block text-xs font-normal opacity-80">Camera roll on your phone, or files on a computer</span>
+                Voice note file
+                <span className="block text-xs font-normal text-muted">An audio recording you already have</span>
               </button>
               {me?.googleConfigured && (
                 <button
@@ -443,12 +518,19 @@ export function Reelbot() {
                 >
                   From Google Photos
                   <span className="block text-xs font-normal text-muted">
-                    {me.googleConnected ? "Opens Google's photo picker" : "Sign in with Google first"}
+                    {me.googleConnected ? "Photos only, via Google's picker" : "Sign in with Google first"}
                   </span>
                 </button>
               )}
             </div>
-            <p className="mt-2 text-xs text-muted">Up to {MAX_DEVICE_PHOTOS} photos. They stay on your device; Claude only sees small previews.</p>
+            <p className="mt-2 text-xs text-muted">
+              Up to {MAX_DEVICE_ITEMS} items. They stay on your device; Claude only sees small previews.
+            </p>
+            {chooser && media.length > 0 && (
+              <button onClick={() => setChooser(null)} className="mt-2 text-xs text-muted underline">
+                Done adding
+              </button>
+            )}
           </div>
         )}
 
@@ -474,8 +556,14 @@ export function Reelbot() {
           </div>
         )}
 
-        {plan && photos.length > 0 && (
-          <VideoPanel plan={plan} photos={photos} sharingEnabled={Boolean(me?.sharingEnabled)} shareRequest={shareRequest} />
+        {plan && media.length > 0 && (
+          <VideoPanel
+            plan={plan}
+            media={media}
+            sharingEnabled={Boolean(me?.sharingEnabled)}
+            shareRequest={shareRequest}
+            uploadMode={me?.shareUploads ?? "blob"}
+          />
         )}
         {error && <p className="text-sm text-danger">{error}</p>}
         <div ref={bottomRef} />
@@ -515,4 +603,10 @@ function Message({ role, text }: Bubble) {
       </div>
     </div>
   );
+}
+
+function formatDuration(s?: number) {
+  if (s === undefined) return "";
+  const r = Math.round(s);
+  return `${Math.floor(r / 60)}:${String(r % 60).padStart(2, "0")}`;
 }
