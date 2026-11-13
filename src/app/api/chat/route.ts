@@ -10,7 +10,8 @@ import {
   type PhotoRef,
   type Selection,
 } from "@/lib/plan";
-import { AskForPhotosInput, ListPhotosInput, SYSTEM_PROMPT, tools, ViewPhotosInput } from "@/lib/tools";
+import { AskForPhotosInput, ListPhotosInput, ShareVideoInput, SYSTEM_PROMPT, tools, ViewPhotosInput } from "@/lib/tools";
+import { sharingEnabled } from "@/lib/config";
 
 export const maxDuration = 300;
 
@@ -84,6 +85,15 @@ async function runTool(name: string, input: unknown, ctx: ToolContext): Promise<
       ctx.emit({ type: "video_plan", plan: parsed.data });
       const total = parsed.data.scenes.reduce((s, x) => s + x.duration_s, 0);
       return { kind: "done", content: `Rendering started in the user's browser: ${parsed.data.scenes.length} scenes, about ${Math.round(total)} s.` };
+    }
+    case "share_video": {
+      const parsed = ShareVideoInput.safeParse(input);
+      if (!parsed.success) return invalid(input);
+      if (!sharingEnabled()) {
+        return { kind: "done", content: "Sharing by text isn't set up on this app yet. Suggest downloading the video and sending it instead.", isError: true };
+      }
+      ctx.emit({ type: "share_request", recipientName: parsed.data.recipient_name, phone: parsed.data.phone });
+      return { kind: "done", content: "A pre-filled share form is now showing under the video. The user must review it and tap Send; nothing has been sent yet." };
     }
     default:
       return { kind: "done", content: `Unknown tool ${name}`, isError: true };
@@ -248,6 +258,8 @@ function statusLabel(tool: string) {
       return "Looking at your photos…";
     case "create_video":
       return "Building the storyboard…";
+    case "share_video":
+      return "Preparing to share…";
     default:
       return "Working…";
   }

@@ -81,7 +81,28 @@ export const tools: Anthropic.Beta.BetaTool[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: "share_video",
+    description:
+      "Prepare to text the current video to someone. The app shows the user a pre-filled form and nothing is sent until they confirm it. Only call this after create_video, and only once you know the recipient's name and phone number (ask for them if the user hasn't said). The recipient can reply by text; their reaction is added to the video as a quote card.",
+    strict: true,
+    eager_input_streaming: true,
+    input_schema: {
+      type: "object",
+      properties: {
+        recipient_name: { type: "string", description: "First name of the person, as the user calls them (e.g. Mom, Dana)" },
+        phone: { type: "string", description: "Their phone number exactly as the user gave it, including country code if given" },
+      },
+      required: ["recipient_name", "phone"],
+      additionalProperties: false,
+    },
+  },
 ];
+
+export const ShareVideoInput = z.object({
+  recipient_name: z.string().trim().min(1).max(40),
+  phone: z.string().trim().min(4).max(30),
+});
 
 export const AskForPhotosInput = z.object({ max_items: z.number().int().min(1).max(100) });
 export const ListPhotosInput = z.object({});
@@ -96,4 +117,5 @@ How you work:
 - Default to roughly 3 seconds per photo, crossfade transitions of 0.8 s, and 16:9, unless the user asks for something else. Vertical 9:16 suits Reels, Shorts and TikTok.
 - Captions are optional; keep them short, and never invent names, places or facts you cannot see in the photo or metadata.
 - After create_video, briefly describe what you made and invite edits ("slower", "add captions", "make it vertical"). Revisions mean calling create_video again with the full updated storyboard.
+- The user can share a finished video by text message: ask for the person's name and phone number, then call share_video. The user confirms in a form before anything is sent, so say that the form is ready rather than that it was sent. People who receive it can text back reactions, which get added to the video as quote cards.
 - Keep replies short and conversational.`;

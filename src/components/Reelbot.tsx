@@ -4,13 +4,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { loadDevicePhotos, MAX_DEVICE_PHOTOS, previewBase64 } from "@/lib/device";
 import type { ChatEvent, ClientToolCall, PhotoRef, Selection, VideoPlan } from "@/lib/plan";
 import { imageUrl } from "@/lib/render";
+import type { ShareRequest } from "./SharePanel";
 import { VideoPanel } from "./VideoPanel";
 
 /** Raw API message as returned by the server; replayed unchanged on every request. */
 type ContentBlock = { type: string; text?: string; content?: unknown };
 type ApiMessage = { role: "user" | "assistant"; content: string | ContentBlock[] };
 type Bubble = { role: "user" | "assistant"; text: string };
-type Me = { googleConfigured: boolean; googleConnected: boolean };
+type Me = { googleConfigured: boolean; googleConnected: boolean; sharingEnabled?: boolean };
 type GooglePick = { sessionId: string; pickerUri: string; status: "waiting" | "expired" };
 
 const MAX_PREVIEWS = 36; // matches the server's per-conversation cap
@@ -63,6 +64,7 @@ export function Reelbot() {
   const [preparing, setPreparing] = useState<string | null>(null);
   const [photos, setPhotos] = useState<PhotoRef[]>([]);
   const [plan, setPlan] = useState<VideoPlan | null>(null);
+  const [shareRequest, setShareRequest] = useState<ShareRequest | null>(null);
   const messagesRef = useRef<ApiMessage[]>([]);
   const selectionRef = useRef<Selection>({ source: "none" });
   const photosRef = useRef<PhotoRef[]>([]);
@@ -145,6 +147,9 @@ export function Reelbot() {
             break;
           case "video_plan":
             setPlan(ev.plan);
+            break;
+          case "share_request":
+            setShareRequest({ recipientName: ev.recipientName, phone: ev.phone, nonce: Date.now() });
             break;
           case "client_tools":
             pending = { calls: ev.calls, results: ev.results };
@@ -469,7 +474,9 @@ export function Reelbot() {
           </div>
         )}
 
-        {plan && photos.length > 0 && <VideoPanel plan={plan} photos={photos} />}
+        {plan && photos.length > 0 && (
+          <VideoPanel plan={plan} photos={photos} sharingEnabled={Boolean(me?.sharingEnabled)} shareRequest={shareRequest} />
+        )}
         {error && <p className="text-sm text-danger">{error}</p>}
         <div ref={bottomRef} />
       </div>

@@ -31,6 +31,7 @@ export function pickMimeType(): string {
 
 type Segment =
   | { kind: "card"; text: string; start: number; duration: number }
+  | { kind: "quote"; text: string; author: string; backdrop?: ImageBitmap; start: number; duration: number }
   | { kind: "photo"; image: ImageBitmap; motion: VideoPlan["scenes"][number]["motion"]; caption?: string; start: number; duration: number };
 
 export function imageUrl(photo: PhotoRef, size = 2048) {
@@ -39,6 +40,13 @@ export function imageUrl(photo: PhotoRef, size = 2048) {
 
 async function loadImage(photo: PhotoRef): Promise<ImageBitmap> {
   if (photo.file) return decodeScaled(photo.file, 2048);
+  if (photo.url) {
+    // Shared photos live in public blob storage; fall back to the same-origin proxy if CORS blocks it.
+    const direct = await fetch(photo.url).catch(() => null);
+    const res = direct?.ok ? direct : await fetch(`/api/shares/image?u=${encodeURIComponent(photo.url)}`);
+    if (!res.ok) throw new Error(`Could not load photo ${photo.id} (${res.status})`);
+    return createImageBitmap(await res.blob());
+  }
   const res = await fetch(imageUrl(photo));
   if (!res.ok) throw new Error(`Could not load ${photo.filename ?? photo.id} (${res.status})`);
   return createImageBitmap(await res.blob());
@@ -48,10 +56,22 @@ function buildTimeline(plan: VideoPlan, images: Map<string, ImageBitmap>) {
   const overlap = plan.transition === "crossfade" ? plan.transition_s : 0;
   type Unstarted = Segment extends infer S ? (S extends Segment ? Omit<S, "start"> : never) : never;
   const raw: Unstarted[] = [];
+  const quotesAfter = (index: number) =>
+    (plan.reactions ?? [])
+      .filter((r) => Math.min(Math.max(r.after_scene, -1), plan.scenes.length - 1) === index)
+      .map((r) => ({
+        kind: "quote" as const,
+        text: r.text,
+        author: r.author,
+        backdrop: images.get(plan.scenes[Math.max(index, 0)].photo_id),
+        duration: quoteDuration(r.text),
+      }));
   if (plan.intro_text) raw.push({ kind: "card", text: plan.intro_text, duration: CARD_S });
-  for (const s of plan.scenes) {
+  raw.push(...quotesAfter(-1));
+  plan.scenes.forEach((s, i) => {
     raw.push({ kind: "photo", image: images.get(s.photo_id)!, motion: s.motion, caption: s.caption, duration: s.duration_s });
-  }
+    raw.push(...quotesAfter(i));
+  });
   if (plan.outro_text) raw.push({ kind: "card", text: plan.outro_text, duration: CARD_S });
 
   const segments: Segment[] = [];
@@ -152,7 +172,38 @@ function drawCard(ctx: CanvasRenderingContext2D, text: string, W: number, H: num
   lines.forEach((line, i) => ctx.fillText(line, W / 2, H / 2 + (i - (lines.length - 1) / 2) * size * 1.2));
 }
 
-function wrap(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+/** Long enough to read comfortably: ~4 words per second plus a beat. */
+function quoteDuration(text: string) {
+  return Math.min(7, Math.max(3, 1.5 + text.split(/\s+/).length * 0.25));
+}
+
+function drawQuote(ctx: CanvasRenderingContext2D, seg: Extract<Segment, { kind: "quote" }>, W: number, H: number, color: string) {
+  if (seg.backdrop) {
+    const img = seg.backdrop;
+    const cover = Math.max(W / img.width, H / img.height) * 1.1;
+    ctx.drawImage(img, (W - img.width * cover) / 2, (H - img.height * cover) / 2, img.width * cover, img.height * cover);
+    ctx.fillStyle = "rgba(8,8,14,0.72)";
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    drawCard(ctx, "", W, H, color);
+  }
+  const unit = Math.min(W, H);
+  const size = Math.round(unit * (seg.text.length > 120 ? 0.045 : 0.06));
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.font = `700 ${Math.round(unit * 0.16)}px Georgia, serif`;
+  ctx.fillText("\u201C", W / 2, H * 0.3);
+  ctx.fillStyle = "#fff";
+  ctx.font = `600 ${size}px system-ui, -apple-system, Segoe UI, sans-serif`;
+  const lines = wrap(ctx, seg.text, W * 0.8, 6);
+  lines.forEach((line, i) => ctx.fillText(line, W / 2, H * 0.5 + (i - (lines.length - 1) / 2) * size * 1.3));
+  ctx.font = `500 ${Math.round(size * 0.75)}px system-ui, -apple-system, Segoe UI, sans-serif`;
+  ctx.fillStyle = "rgba(255,255,255,0.8)";
+  ctx.fillText(`\u2014 ${seg.author}`, W / 2, H * 0.5 + ((lines.length + 1) / 2) * size * 1.3 + size * 0.6);
+}
+
+function wrap(ctx: CanvasRenderingContext2D, text: string, maxWidth: number, maxLines = 3): string[] {
   const words = text.split(/\s+/);
   const lines: string[] = [];
   let line = "";
@@ -164,7 +215,93 @@ function wrap(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): st
     } else line = next;
   }
   if (line) lines.push(line);
-  return lines.slice(0, 3);
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines);
+    kept[maxLines - 1] += "\u2026";
+    return kept;
+  }
+  return lines;
+}
+
+export type Storyboard = {
+  width: number;
+  height: number;
+  total: number;
+  /** Draws the frame at time t (seconds) onto ctx. */
+  draw: (ctx: CanvasRenderingContext2D, t: number) => void;
+  dispose: () => void;
+};
+
+/** Loads the photos a plan needs and returns a frame-drawing function for it. */
+export async function prepareStoryboard(
+  plan: VideoPlan,
+  photos: PhotoRef[],
+  onProgress?: (fraction: number, label: string) => void,
+): Promise<Storyboard> {
+  const byId = new Map(photos.map((p) => [p.id, p]));
+  const ids = [...new Set(plan.scenes.map((s) => s.photo_id))];
+  const images = new Map<string, ImageBitmap>();
+  let loaded = 0;
+  // A few at a time keeps memory in check on phones.
+  const queue = [...ids];
+  const worker = async () => {
+    for (let id = queue.shift(); id; id = queue.shift()) {
+      const ref = byId.get(id);
+      if (!ref) throw new Error(`Photo ${id} is not in the current selection`);
+      images.set(id, await loadImage(ref));
+      onProgress?.(++loaded / ids.length, `Loading photos ${loaded}/${ids.length}`);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+
+  const { width: W, height: H } = dimensions(plan.aspect);
+  const { segments, total } = buildTimeline(plan, images);
+  const color = plan.accent_color ?? "#4f46e5";
+
+  const draw = (ctx: CanvasRenderingContext2D, t: number) => {
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+    segments.forEach((seg, i) => {
+      if (t < seg.start || t > seg.start + seg.duration) return;
+      ctx.globalAlpha = alphaFor(seg, t, plan, i === 0, i === segments.length - 1);
+      if (seg.kind === "card") drawCard(ctx, seg.text, W, H, color);
+      else if (seg.kind === "quote") drawQuote(ctx, seg, W, H, color);
+      else drawPhoto(ctx, seg, (t - seg.start) / seg.duration, W, H);
+    });
+    ctx.globalAlpha = 1;
+  };
+  return { width: W, height: H, total, draw, dispose: () => images.forEach((img) => img.close()) };
+}
+
+/** Plays a storyboard on a canvas (no recording). Resolves when it ends or the signal aborts. */
+export function playStoryboard(
+  canvas: HTMLCanvasElement,
+  sb: Storyboard,
+  opts: { signal?: AbortSignal; from?: number; onTime?: (t: number) => void } = {},
+): Promise<void> {
+  canvas.width = sb.width;
+  canvas.height = sb.height;
+  const ctx = canvas.getContext("2d")!;
+  const t0 = performance.now() - (opts.from ?? 0) * 1000;
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (opts.signal?.aborted) return resolve();
+      const t = Math.min((performance.now() - t0) / 1000, sb.total);
+      sb.draw(ctx, t);
+      opts.onTime?.(t);
+      if (t >= sb.total) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+/** Draws a single frame (e.g. a poster before playback starts). */
+export function drawFrame(canvas: HTMLCanvasElement, sb: Storyboard, t: number) {
+  canvas.width = sb.width;
+  canvas.height = sb.height;
+  sb.draw(canvas.getContext("2d")!, t);
 }
 
 export type RenderResult = { blob: Blob; mimeType: string; durationS: number };
@@ -182,43 +319,13 @@ export async function renderVideo(opts: {
   if (!mimeType) throw new Error("This browser can't record video. Try a recent Chrome, Edge, Firefox or Safari.");
 
   // 1. Load images
-  const byId = new Map(photos.map((p) => [p.id, p]));
-  const ids = [...new Set(plan.scenes.map((s) => s.photo_id))];
-  const images = new Map<string, ImageBitmap>();
-  let loaded = 0;
-  // A few at a time keeps memory in check on phones.
-  const queue = [...ids];
-  const worker = async () => {
-    for (let id = queue.shift(); id; id = queue.shift()) {
-      const ref = byId.get(id);
-      if (!ref) throw new Error(`Photo ${id} is not in the current selection`);
-      images.set(id, await loadImage(ref));
-      onProgress?.((++loaded / ids.length) * 0.1, `Loading photos ${loaded}/${ids.length}`);
-    }
-  };
-  await Promise.all([worker(), worker(), worker()]);
-
-  const { width: W, height: H } = dimensions(plan.aspect);
-  canvas.width = W;
-  canvas.height = H;
+  const sb = await prepareStoryboard(plan, photos, (f, label) => onProgress?.(f * 0.1, label));
+  const total = sb.total;
+  canvas.width = sb.width;
+  canvas.height = sb.height;
   const ctx = canvas.getContext("2d")!;
-  const { segments, total } = buildTimeline(plan, images);
-  const color = plan.accent_color ?? "#4f46e5";
-
-  const draw = (t: number) => {
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, W, H);
-    segments.forEach((seg, i) => {
-      if (t < seg.start || t > seg.start + seg.duration) return;
-      ctx.globalAlpha = alphaFor(seg, t, plan, i === 0, i === segments.length - 1);
-      if (seg.kind === "card") drawCard(ctx, seg.text, W, H, color);
-      else drawPhoto(ctx, seg, (t - seg.start) / seg.duration, W, H);
-    });
-    ctx.globalAlpha = 1;
-  };
+  const draw = (t: number) => sb.draw(ctx, t);
   draw(0);
-
   // 2. Set up recording (video from canvas, optional soundtrack)
   const stream = canvas.captureStream(FPS);
   let audioCtx: AudioContext | null = null;
@@ -263,7 +370,7 @@ export async function renderVideo(opts: {
     audioSource?.stop();
     void audioCtx?.close();
     stream.getTracks().forEach((track) => track.stop());
-    images.forEach((img) => img.close());
+    sb.dispose();
   });
   await stopped;
 

@@ -57,6 +57,23 @@ npm run dev   # http://localhost:3000
 
 The chat route sets `maxDuration = 300`. On Vercel plans with a lower function limit, the platform caps it.
 
+## Share by text message
+
+Under a finished video, **Share by text message** (or just tell the chatbot "send it to Mom, +1 555 123 4567") texts the person a link to the video. When they reply to that text, their reply is added to the video as a quote card. Claude places it next to the moment they're talking about, or at the end if it's about the whole video. Everyone with the link sees the updated video. The page plays the video live and refreshes itself every few seconds, and anyone can save it as an MP4.
+
+How it works:
+- Sharing uploads the video's photos (resized to 1920 px) to Vercel Blob. The storyboard, the recipients and the reactions are stored in Upstash Redis. Links look like `/s/<random id>`, and phone numbers are never shown on the page.
+- Twilio sends the text. Replies come in at `/api/sms/inbound`, which checks Twilio's signature. STOP/HELP keywords are left to Twilio, and a reply is matched to the latest video texted to that number.
+- Sending needs the `SHARE_PASSCODE`, and there's a cap of 50 texts per day, so a public deployment can't be used to spam people.
+
+Setup:
+1. **Vercel storage.** In your Vercel project: **Storage → Create → Blob**, then **Storage → Create → Upstash (Redis)**. Connect both to the project; this adds their environment variables for you.
+2. **Twilio.** Create an account at twilio.com and buy a phone number that can send SMS. Add `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` and `TWILIO_FROM_NUMBER` (in +1… format) to Vercel.
+3. In the Twilio console, open **Phone Numbers → your number → Messaging**. Under "A message comes in", choose **Webhook**, `https://<your-domain>/api/sms/inbound`, **HTTP POST**.
+4. Add `SHARE_PASSCODE` (any secret phrase) and `APP_URL` (`https://<your-domain>`, exactly as in the webhook URL), then redeploy.
+
+US texting rules: carriers block texts from unregistered numbers. Before texting US numbers, register for **A2P 10DLC** in the Twilio console (or use a toll-free number and complete toll-free verification). Approval can take a few days. A Twilio trial account can only text numbers you've verified, and adds a "Sent from your Twilio trial account" prefix. That's fine for trying it out.
+
 ## Notes and limits
 
 - A picker session and its photo URLs expire after roughly an hour. If rendering fails with a 403, pick the photos again.

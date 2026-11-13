@@ -3,10 +3,21 @@
 import { useEffect, useRef, useState } from "react";
 import type { PhotoRef, VideoPlan } from "@/lib/plan";
 import { renderVideo } from "@/lib/render";
+import { SharePanel, type ShareRequest } from "./SharePanel";
 
 type Output = { url: string; ext: string; durationS: number };
 
-export function VideoPanel({ plan, photos }: { plan: VideoPlan; photos: PhotoRef[] }) {
+export function VideoPanel({
+  plan,
+  photos,
+  sharingEnabled = false,
+  shareRequest = null,
+}: {
+  plan: VideoPlan;
+  photos: PhotoRef[];
+  sharingEnabled?: boolean;
+  shareRequest?: ShareRequest | null;
+}) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [audio, setAudio] = useState<File | null>(null);
   const [progress, setProgress] = useState<{ f: number; label: string } | null>(null);
@@ -103,6 +114,7 @@ export function VideoPanel({ plan, photos }: { plan: VideoPlan; photos: PhotoRef
           </button>
         )}
       </div>
+      {sharingEnabled && <SharePanel plan={plan} photos={photos} request={shareRequest} />}
     </div>
   );
 }

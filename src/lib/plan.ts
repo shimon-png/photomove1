@@ -23,7 +23,13 @@ export const VideoPlanSchema = z.object({
   scenes: z.array(SceneSchema).min(1).max(100),
 });
 
-export type VideoPlan = z.infer<typeof VideoPlanSchema>;
+/**
+ * A reaction texted back by someone the video was shared with. Rendered as a
+ * quote card inserted after scene `after_scene` (-1 = before the first scene).
+ */
+export type ReactionCard = { after_scene: number; text: string; author: string };
+
+export type VideoPlan = z.infer<typeof VideoPlanSchema> & { reactions?: ReactionCard[] };
 
 /** Photo metadata Claude sees. Ids are short (p1, p2, …) and stable for a selection. */
 export const PhotoMetaSchema = z.object({
@@ -38,9 +44,10 @@ export type PhotoMeta = z.infer<typeof PhotoMetaSchema>;
 /**
  * A photo as the browser holds it. Google photos carry a baseUrl (served via
  * the image proxy); camera-roll photos carry the File itself and never leave
- * the device except as small previews Claude asks to see.
+ * the device except as small previews Claude asks to see — unless the user
+ * shares the video, which uploads them and gives each a public `url`.
  */
-export type PhotoRef = PhotoMeta & { baseUrl?: string; file?: File };
+export type PhotoRef = PhotoMeta & { baseUrl?: string; file?: File; url?: string };
 
 /** Which photos the conversation is working with; sent on every chat request. */
 export const SelectionSchema = z.discriminatedUnion("source", [
@@ -58,6 +65,7 @@ export type ChatEvent =
   | { type: "status"; text: string }
   | { type: "choose_photos"; maxItems: number }
   | { type: "video_plan"; plan: VideoPlan }
+  | { type: "share_request"; recipientName: string; phone: string }
   | { type: "messages"; messages: unknown[] }
   /** Tools the browser must run (e.g. previews of camera-roll photos); `results` are the server-run ones from the same turn. */
   | { type: "client_tools"; calls: ClientToolCall[]; results: unknown[] }
