@@ -121,7 +121,10 @@ export function Reelbot() {
       setMe((m) => (m ? { ...m, googleConnected: false } : m));
       throw new Error("Your Google session expired. Reconnect Google Photos or choose photos from your device.");
     }
-    if (!res.ok || !res.body) throw new Error(`Request failed (${res.status})`);
+    if (!res.ok || !res.body) {
+      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(data?.error ?? `Request failed (${res.status})`);
+    }
 
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
     let buf = "";

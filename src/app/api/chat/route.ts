@@ -141,6 +141,12 @@ function countViewed(messages: Anthropic.Beta.BetaMessageParam[]): number {
 }
 
 export async function POST(req: Request) {
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+    return Response.json(
+      { error: "This app has no Claude API key yet. Add ANTHROPIC_API_KEY in your Vercel project's Settings → Environment Variables, then redeploy." },
+      { status: 500 },
+    );
+  }
   const parsedBody = Body.safeParse(await req.json().catch(() => null));
   if (!parsedBody.success) return Response.json({ error: "Bad request" }, { status: 400 });
   const { selection } = parsedBody.data;
